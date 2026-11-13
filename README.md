@@ -216,3 +216,34 @@ docker pull prom/prom2json
 
 docker run --rm -ti prom/prom2json http://my-prometheus-client.example.org:8080/metrics
 ```
+
+## Batch mode
+
+Instead of a single metrics endpoint, prom2json can scrape a list of
+targets concurrently:
+
+```bash
+prom2json --targets targets.json --out-dir out --concurrency 4 --timeout 30s --retries 1
+```
+
+The targets file is a JSON array with one object per target. The name is
+used as the output file name and may only contain lowercase letters,
+digits, underscores and hyphens:
+
+```json
+[
+  {"name": "node-1", "url": "http://node-1.example.org:9100/metrics"},
+  {"name": "app_2", "url": "https://app-2.example.org/metrics"}
+]
+```
+
+The whole file is validated before anything is scraped; an invalid file
+(duplicate or malformed names, missing fields, non-http(s) URLs) exits
+with code 2 without writing anything. Each successful target is written
+to `<name>.json` in the output directory (default `./out`) with the same
+JSON structure the single-target mode prints. A failing target (after
+`--retries` retries of connection errors, timeouts and 5xx responses)
+does not stop the other targets; if any target failed, the exit code is
+1. Every run also writes `manifest.json` (per-target status, metric
+counts, attempts and errors) and `summary.json` (run totals and which
+metric families appeared in how many targets) into the output directory.
