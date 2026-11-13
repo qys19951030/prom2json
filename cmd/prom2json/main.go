@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"github.com/prometheus/common/version"
 
 	"github.com/prometheus/prom2json"
+	"github.com/prometheus/prom2json/batch"
 )
 
 var usage = `The path or URL to metrics to convert, if omitted, defaults to read from STDIN.
@@ -52,6 +54,11 @@ func main() {
 			"dots",
 			"values",
 		)
+	targetsFile := kingpin.Flag("targets", "Path to a JSON file listing targets to scrape in batch mode. Mutually exclusive with the METRICS_PATH | METRICS_URL argument.").PlaceHolder("FILE").String()
+	concurrency := kingpin.Flag("concurrency", "Maximum number of targets scraped concurrently in batch mode.").Default("4").Int()
+	timeout := kingpin.Flag("timeout", "Timeout for a single scrape attempt of one target in batch mode.").Default("30s").Duration()
+	retries := kingpin.Flag("retries", "Number of retries per target in batch mode. Only connection errors, timeouts and 5xx responses are retried.").Default("1").Int()
+	outDir := kingpin.Flag("out-dir", "Directory the batch mode writes results, manifest.json and summary.json to.").Default("out").PlaceHolder("DIR").String()
 
 	kingpin.CommandLine.UsageWriter(os.Stderr)
 	kingpin.Version(version.Print("prom2json"))
@@ -62,6 +69,14 @@ func main() {
 	arg := kingpin.Arg("METRICS_PATH | METRICS_URL", usage).String()
 
 	kingpin.Parse()
+
+	if *targetsFile != "" {
+		if *arg != "" {
+			fmt.Fprintln(os.Stderr, "error: --targets and the METRICS_PATH | METRICS_URL argument are mutually exclusive")
+			os.Exit(2)
+		}
+		os.Exit(runBatchMode(*targetsFile, *outDir, *concurrency, *timeout, *retries, *cert, *key, *skipServerCertCheck, *escapingScheme))
+	}
 
 	if *arg == "" {
 		// Use stdin on empty argument.
@@ -118,6 +133,47 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println()
+}
+
+// runBatchMode executes a batch run over the targets listed in targetsFile
+// and returns the process exit code: 0 if all targets were scraped
+// successfully, 1 if any target failed or the results could not be written,
+// and 2 if the targets file is invalid.
+func runBatchMode(
+	targetsFile string, outDir string, concurrency int, timeout time.Duration, retries int,
+	cert string, key string, skipServerCertCheck bool, escapingScheme string,
+) int {
+	if (cert != "" && key == "") || (cert == "" && key != "") {
+		fmt.Fprintf(os.Stderr, "%s\n with TLS client authentication: %s --cert /path/to/certificate --key /path/to/key --targets TARGETS_FILE", usage, os.Args[0])
+		return 1
+	}
+	targets, err := batch.LoadTargets(targetsFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+	transport, err := makeTransport(cert, key, skipServerCertCheck)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	ok, err := batch.Run(context.Background(), targets, batch.Options{
+		Concurrency:    concurrency,
+		Timeout:        timeout,
+		Retries:        retries,
+		OutDir:         outDir,
+		Transport:      transport,
+		EscapingScheme: escapingScheme,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	if !ok {
+		fmt.Fprintln(os.Stderr, "error: at least one target failed, see manifest.json for details")
+		return 1
+	}
+	return 0
 }
 
 func makeTransport(
